@@ -1,0 +1,106 @@
+==============================================================================
+ GitHub Actions -> ECR -> EKS  : One-time AWS setup
+==============================================================================
+
+!!! THE #1 GOTCHA !!!
+The IAM role name MUST be identical in ALL THREE places:
+   (a) the role you create            (Step 3)
+   (b) the EKS access entry           (Step 4)
+   (c) the AWS_ROLE_ARN GitHub secret (Step 5)
+If they drift apart, the pipeline pushes to ECR fine but kubectl fails with:
+   "the server has asked for the client to provide credentials"  (HTTP 401)
+because EKS does not recognize the role the workflow actually assumed.
+
+To make drift impossible, we define the names ONCE as shell variables below
+and reuse them in every command. Set these first, in the same terminal:
+
+  export ROLE_NAME=GHA-Role
+  export CLUSTER_NAME=ekswithavinash
+  export AWS_REGION=ap-south-1
+  export ACCOUNT_ID=655700896650
+
+(Use the SAME ROLE_NAME you intend to put in the AWS_ROLE_ARN secret.)
+
+------------------------------------------------------------------------------
+Step 1 - OIDC provider (once per AWS account; skip if it already exists)
+------------------------------------------------------------------------------
+aws iam create-open-id-connect-provider \
+  --url https://token.actions.githubusercontent.com \
+  --client-id-list sts.amazonaws.com \
+  --thumbprint-list 6938fd4d98bab03faadb97b34396831e3780aea1
+
+# Check whether it already exists:
+#   aws iam list-open-id-connect-providers
+
+------------------------------------------------------------------------------
+Step 2 - Edit the trust policy file
+------------------------------------------------------------------------------
+Open github-actions-trust-policy.json and confirm the "sub" line matches your
+repo exactly, e.g.:
+   "token.actions.githubusercontent.com:sub": "repo:avizway1/task-management-GHA:*"
+
+------------------------------------------------------------------------------
+Step 3 - Create the IAM role  (uses $ROLE_NAME)
+------------------------------------------------------------------------------
+aws iam create-role \
+  --role-name "$ROLE_NAME" \
+  --assume-role-policy-document file://github-actions-trust-policy.json
+
+aws iam put-role-policy \
+  --role-name "$ROLE_NAME" \
+  --policy-name GitHubActionsPolicy \
+  --policy-document file://github-actions-iam-policy.json
+
+------------------------------------------------------------------------------
+Step 4 - Grant the SAME role access to the EKS cluster  (uses $ROLE_NAME)
+------------------------------------------------------------------------------
+aws eks create-access-entry \
+  --cluster-name "$CLUSTER_NAME" \
+  --principal-arn "arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}" \
+  --type STANDARD \
+  --region "$AWS_REGION"
+
+aws eks associate-access-policy \
+  --cluster-name "$CLUSTER_NAME" \
+  --principal-arn "arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}" \
+  --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy \
+  --access-scope type=cluster \
+  --region "$AWS_REGION"
+
+------------------------------------------------------------------------------
+Step 5 - Add GitHub Secrets (repo Settings -> Secrets and variables -> Actions)
+------------------------------------------------------------------------------
+Secret            Value
+AWS_ROLE_ARN      arn:aws:iam::655700896650:role/GHA-Role     <- MUST match $ROLE_NAME
+AWS_ACCOUNT_ID    655700896650
+EKS_CLUSTER_NAME  ekswithavinash                              <- MUST match $CLUSTER_NAME
+
+------------------------------------------------------------------------------
+Step 6 - VERIFY before running the pipeline (catches the 401 in advance)
+------------------------------------------------------------------------------
+# 6a. Confirm the access entry exists for the EXACT role in AWS_ROLE_ARN.
+#     The role below MUST appear in the list:
+aws eks list-access-entries \
+  --cluster-name "$CLUSTER_NAME" \
+  --region "$AWS_REGION"
+#  -> expect to see: arn:aws:iam::655700896650:role/GHA-Role
+
+# 6b. Confirm the cluster API is reachable from the internet (GitHub runners):
+aws eks describe-cluster \
+  --name "$CLUSTER_NAME" \
+  --region "$AWS_REGION" \
+  --query "cluster.resourcesVpcConfig.{public:endpointPublicAccess,cidrs:publicAccessCidrs}"
+#  -> expect: public=true and cidrs include 0.0.0.0/0
+#     (if public=false, GitHub-hosted runners cannot reach the API server)
+
+CHECKLIST - all three must be the SAME role name (GHA-Role):
+  [ ] Step 3 created role .............. GHA-Role
+  [ ] Step 4 access entry uses ......... GHA-Role
+  [ ] Step 5 AWS_ROLE_ARN ends with .... role/GHA-Role
+  [ ] Step 6a list-access-entries shows  role/GHA-Role
+  [ ] Step 6b endpointPublicAccess ..... true
+
+==============================================================================
+ After this, every push to main builds changed services, pushes to ECR,
+ and deploys to EKS automatically via .github/workflows/ci-cd.yml
+==============================================================================

@@ -1,0 +1,105 @@
+# Ingress (AWS ALB with Route53 Domain)
+# 
+# BEFORE DEPLOYING:
+# 1. Replace <ACM_CERTIFICATE_ARN> with your ACM certificate ARN for awswithavinashreddy.com
+#    Get it from: aws acm list-certificates --region ap-south-1
+# 2. Ensure your Route53 hosted zone exists for awswithavinashreddy.com
+#
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: task-management-ingress
+  namespace: task-management
+  annotations:
+    # ALB Configuration
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/load-balancer-name: task-management-alb
+    
+    # HTTPS/SSL Configuration
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:ap-south-1:655700896650:certificate/eec0852d-b0cd-4fe6-a7a2-5724ae9b2ccd
+    
+    # Health Check Configuration
+    alb.ingress.kubernetes.io/healthcheck-path: /health
+    alb.ingress.kubernetes.io/healthcheck-timeout-seconds: "10"
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "30"
+    alb.ingress.kubernetes.io/success-codes: "200,404"
+    
+    # Performance
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=60
+    
+    # External DNS (auto-creates Route53 record)
+    external-dns.alpha.kubernetes.io/hostname: awswithavinashreddy.com,www.awswithavinashreddy.com,jaeger.awswithavinashreddy.com
+spec:
+  ingressClassName: alb
+  rules:
+  # Main domain
+  - host: awswithavinashreddy.com
+    http:
+      paths:
+      - path: /api/auth
+        pathType: Prefix
+        backend:
+          service:
+            name: user-service
+            port:
+              number: 3001
+      - path: /api/users
+        pathType: Prefix
+        backend:
+          service:
+            name: user-service
+            port:
+              number: 3001
+      - path: /api/tasks
+        pathType: Prefix
+        backend:
+          service:
+            name: task-service
+            port:
+              number: 3002
+      - path: /api/notifications
+        pathType: Prefix
+        backend:
+          service:
+            name: notification-service
+            port:
+              number: 3003
+      - path: /api/analytics
+        pathType: Prefix
+        backend:
+          service:
+            name: analytics-service
+            port:
+              number: 3004
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: frontend-service
+            port:
+              number: 80
+  # WWW subdomain
+  - host: www.awswithavinashreddy.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: frontend-service
+            port:
+              number: 80
+  # Jaeger tracing UI
+  - host: jaeger.awswithavinashreddy.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: jaeger-query
+            port:
+              number: 16686

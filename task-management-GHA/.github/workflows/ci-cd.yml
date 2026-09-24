@@ -1,0 +1,211 @@
+# Required GitHub Secrets (Settings → Secrets and Variables → Actions):
+#   AWS_ROLE_ARN     - ARN of the IAM role created for GitHub OIDC
+#   AWS_ACCOUNT_ID   - 655700896650
+#   EKS_CLUSTER_NAME - your EKS cluster name
+#
+# One-time AWS setup (see github-actions-trust-policy.json and github-actions-iam-policy.json):
+#   1. Create OIDC provider in IAM for token.actions.githubusercontent.com
+#   2. Create IAM role with the trust + permissions policy files in this repo
+#   3. Add the IAM role to EKS cluster access (see step 3 in README or run:
+#      aws eks create-access-entry --cluster-name <name> --principal-arn <role-arn> --type STANDARD
+#      aws eks associate-access-policy --cluster-name <name> --principal-arn <role-arn> \
+#        --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy \
+#        --access-scope type=cluster
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ap-south-1
+
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      frontend: ${{ steps.filter.outputs.frontend }}
+      user-service: ${{ steps.filter.outputs.user-service }}
+      task-service: ${{ steps.filter.outputs.task-service }}
+      notification-service: ${{ steps.filter.outputs.notification-service }}
+      analytics-service: ${{ steps.filter.outputs.analytics-service }}
+      k8s: ${{ steps.filter.outputs.k8s }}
+      any-service: ${{ steps.filter.outputs.any-service }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed paths
+        id: filter
+        env:
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: |
+          # Manual trigger (workflow_dispatch) or first push: build everything
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" || \
+                "$BEFORE" == "0000000000000000000000000000000000000000" ]]; then
+            echo "Manual trigger or first push — marking all services as changed"
+            for key in frontend user-service task-service notification-service analytics-service k8s any-service; do
+              echo "${key}=true" >> "$GITHUB_OUTPUT"
+            done
+            exit 0
+          fi
+
+          CHANGED=$(git diff --name-only "$BEFORE" "$SHA")
+          echo "Changed files:"
+          echo "$CHANGED"
+
+          has_changes() { echo "$CHANGED" | grep -q "^$1/" && echo "true" || echo "false"; }
+
+          FRONTEND=$(has_changes frontend)
+          USER_SVC=$(has_changes user-service)
+          TASK_SVC=$(has_changes task-service)
+          NOTIF_SVC=$(has_changes notification-service)
+          ANALYTICS=$(has_changes analytics-service)
+          K8S=$(has_changes k8s)
+
+          echo "frontend=${FRONTEND}"             >> "$GITHUB_OUTPUT"
+          echo "user-service=${USER_SVC}"         >> "$GITHUB_OUTPUT"
+          echo "task-service=${TASK_SVC}"         >> "$GITHUB_OUTPUT"
+          echo "notification-service=${NOTIF_SVC}" >> "$GITHUB_OUTPUT"
+          echo "analytics-service=${ANALYTICS}"  >> "$GITHUB_OUTPUT"
+          echo "k8s=${K8S}"                       >> "$GITHUB_OUTPUT"
+
+          if [[ "$FRONTEND" == "true" || "$USER_SVC" == "true" || "$TASK_SVC" == "true" || \
+                "$NOTIF_SVC" == "true" || "$ANALYTICS" == "true" ]]; then
+            echo "any-service=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "any-service=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-push:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.any-service == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push changed services
+        run: |
+          REGISTRY="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+          SHA="${{ github.sha }}"
+
+          build_and_push() {
+            local SERVICE=$1
+            echo "==> Building ${SERVICE}"
+            docker buildx build \
+              --platform linux/amd64 \
+              --push \
+              -t "${REGISTRY}/task-management/${SERVICE}:${SHA}" \
+              -t "${REGISTRY}/task-management/${SERVICE}:latest" \
+              "./${SERVICE}"
+            echo "==> Pushed ${SERVICE}:${SHA}"
+          }
+
+          if [[ "${{ needs.detect-changes.outputs.frontend }}" == "true" ]];             then build_and_push frontend;             fi
+          if [[ "${{ needs.detect-changes.outputs.user-service }}" == "true" ]];         then build_and_push user-service;         fi
+          if [[ "${{ needs.detect-changes.outputs.task-service }}" == "true" ]];         then build_and_push task-service;         fi
+          if [[ "${{ needs.detect-changes.outputs.notification-service }}" == "true" ]]; then build_and_push notification-service; fi
+          if [[ "${{ needs.detect-changes.outputs.analytics-service }}" == "true" ]];    then build_and_push analytics-service;    fi
+
+  deploy:
+    needs: [detect-changes, build-push]
+    # Run when: services were built successfully OR only k8s manifests changed
+    if: |
+      always() &&
+      needs.detect-changes.result == 'success' &&
+      (needs.build-push.result == 'success' || needs.build-push.result == 'skipped') &&
+      (needs.detect-changes.outputs.any-service == 'true' || needs.detect-changes.outputs.k8s == 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ secrets.EKS_CLUSTER_NAME }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Debug cluster access
+        run: |
+          echo "=== Who am I (the identity EKS will see) ==="
+          aws sts get-caller-identity
+          echo ""
+          echo "=== Cluster endpoint / public access config ==="
+          aws eks describe-cluster \
+            --name ${{ secrets.EKS_CLUSTER_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --query "cluster.{endpointPublicAccess:resourcesVpcConfig.endpointPublicAccess,endpointPrivateAccess:resourcesVpcConfig.endpointPrivateAccess,publicAccessCidrs:resourcesVpcConfig.publicAccessCidrs}"
+          echo ""
+          echo "=== Access entries on the cluster ==="
+          aws eks list-access-entries \
+            --cluster-name ${{ secrets.EKS_CLUSTER_NAME }} \
+            --region ${{ env.AWS_REGION }}
+          echo ""
+          echo "=== Test kubectl (verbose) ==="
+          kubectl get nodes -v=6 2>&1 | head -40
+
+      - name: Set up Kustomize
+        run: |
+          curl -sfLo kustomize.tar.gz \
+            https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.3.0/kustomize_v5.3.0_linux_amd64.tar.gz
+          tar -xzf kustomize.tar.gz
+          sudo mv kustomize /usr/local/bin/
+
+      - name: Update image tags for changed services
+        run: |
+          REGISTRY="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+          SHA="${{ github.sha }}"
+          cd k8s
+
+          if [[ "${{ needs.detect-changes.outputs.frontend }}" == "true" ]]; then
+            kustomize edit set image task-management/frontend=${REGISTRY}/task-management/frontend:${SHA}
+          fi
+          if [[ "${{ needs.detect-changes.outputs.user-service }}" == "true" ]]; then
+            kustomize edit set image task-management/user-service=${REGISTRY}/task-management/user-service:${SHA}
+          fi
+          if [[ "${{ needs.detect-changes.outputs.task-service }}" == "true" ]]; then
+            kustomize edit set image task-management/task-service=${REGISTRY}/task-management/task-service:${SHA}
+          fi
+          if [[ "${{ needs.detect-changes.outputs.notification-service }}" == "true" ]]; then
+            kustomize edit set image task-management/notification-service=${REGISTRY}/task-management/notification-service:${SHA}
+          fi
+          if [[ "${{ needs.detect-changes.outputs.analytics-service }}" == "true" ]]; then
+            kustomize edit set image task-management/analytics-service=${REGISTRY}/task-management/analytics-service:${SHA}
+          fi
+
+      - name: Apply to EKS
+        run: kubectl apply -k k8s/ --validate=false
+
+      - name: Verify rollouts
+        run: |
+          for SERVICE in frontend user-service task-service notification-service analytics-service; do
+            echo "==> Checking rollout: ${SERVICE}"
+            kubectl rollout status deployment/${SERVICE} -n task-management --timeout=180s
+          done

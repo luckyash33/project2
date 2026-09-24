@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: task-management
+data:
+  NODE_ENV: "production"
+  MONGODB_DB: "taskmanager"
+  POSTGRES_DB: "taskmanager"
+  # OpenTelemetry / Jaeger — OTLP HTTP collector endpoint (shared by all services)
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger-collector:4318"

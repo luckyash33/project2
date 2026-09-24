@@ -1,0 +1,88 @@
+# Jaeger all-in-one (in-memory) — collector + query UI + storage in a single pod.
+# Suitable for demo/capstone use. Traces are held in memory and lost on pod restart.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger
+  namespace: task-management
+  labels:
+    app: jaeger
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jaeger
+  template:
+    metadata:
+      labels:
+        app: jaeger
+    spec:
+      containers:
+      - name: jaeger
+        image: jaegertracing/all-in-one:1.62.0
+        env:
+        - name: COLLECTOR_OTLP_ENABLED
+          value: "true"
+        - name: SPAN_STORAGE_TYPE
+          value: "memory"
+        ports:
+        - containerPort: 16686   # Query UI
+        - containerPort: 4317    # OTLP gRPC
+        - containerPort: 4318    # OTLP HTTP
+        - containerPort: 14269   # Admin / health
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "300m"
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 14269
+          initialDelaySeconds: 15
+          periodSeconds: 15
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 14269
+          initialDelaySeconds: 5
+          periodSeconds: 10
+---
+# Ingestion endpoints used by the services (OTLP).
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger-collector
+  namespace: task-management
+  labels:
+    app: jaeger
+spec:
+  selector:
+    app: jaeger
+  ports:
+  - name: otlp-grpc
+    port: 4317
+    targetPort: 4317
+  - name: otlp-http
+    port: 4318
+    targetPort: 4318
+  type: ClusterIP
+---
+# Jaeger UI — fronted by the ALB ingress (jaeger.awswithavinashreddy.com).
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger-query
+  namespace: task-management
+  labels:
+    app: jaeger
+spec:
+  selector:
+    app: jaeger
+  ports:
+  - name: query
+    port: 16686
+    targetPort: 16686
+  type: ClusterIP
