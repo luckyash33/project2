@@ -1,6 +1,6 @@
 # Required GitHub Secrets (Settings → Secrets and Variables → Actions):
 #   AWS_ROLE_ARN     - ARN of the IAM role created for GitHub OIDC
-#   AWS_ACCOUNT_ID   - 655700896650
+#   AWS_ACCOUNT_ID   - 6557008966501
 #   EKS_CLUSTER_NAME - your EKS cluster name
 #
 # One-time AWS setup (see github-actions-trust-policy.json and github-actions-iam-policy.json):
